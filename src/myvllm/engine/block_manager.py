@@ -4,11 +4,22 @@ from collections import deque
 
 from myvllm.engine.sequence import Sequence
 
+# 表示一个固定大小的内存块，用于存储 KV cache
+
+# Background
+# LLM 推理时，每个 token 在每一层 attention 里都会产生 Key/Value cache
+# 为了避免每次生成都重新计算历史 token 的 KV
+# 系统会把历史 token 的 KV cache 保存在显存里
 class Block:
     def __init__(self, block_id):
         self.block_id = block_id
+        # 这个 block 对应 token 内容的 hash，用于 prefix cache 查找
         self.hash = -1 
+
+        # 引用计数 有多少条序列正在使用这个 Block
         self.ref_count = 0
+        
+        # 这个 block 里存的 token_ids
         self.token_ids = []
 
 
@@ -16,19 +27,28 @@ class Block:
         self.hash = h 
         self.token_ids = token_ids
 
+    # 重置 block 信息
     def reset(self):
         self.hash = -1 
         self.ref_count = 0
         self.token_ids = []
 
+
+
+
 class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         # block_size: number of tokens per block
         self.block_size: int = block_size
+
         # list of all blocks
+        # [Block(0), Block(1), Block(2), ...]
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        
         # hash to block id: this is for prefix caching
+        # hash -> block_id
         self.hash_to_block_id: dict[int, int] = {}
+
         # free block ids
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         # used block ids
@@ -43,6 +63,7 @@ class BlockManager:
         h.update(np.array(token_ids, dtype=np.int32).tobytes())
         return h.intdigest()
 
+    # 分配一个物理 Block
     # move this block to used list
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
@@ -52,6 +73,7 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return block
 
+    # 释放一个物理 Block
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0, "Block is still in use"
         block = self.blocks[block_id]
@@ -59,8 +81,11 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    # 判断是否能给序列分配 block
     # whether we can allocate a block for this sequence
     def can_allocate(self, seq: Sequence) -> bool:
+        # seq.num_blocks 这条序列当前 token 需要多少个 block
+        # 如果 空闲block数量 >= 这条序列需要的 block数量 就说明可以分配
         return len(self.free_block_ids) >= seq.num_blocks
 
 
@@ -68,7 +93,8 @@ class BlockManager:
         h = -1
         for i in range(seq.num_blocks):
             no_cache_found = False
-
+            
+            # 取出这条序列的第 i 个 block 对应的 token_ids
             token_ids = seq.block(i)
             # only compute hash for full blocks, always -1 for partial blocks
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1

@@ -219,6 +219,11 @@ class Qwen3DecoderLayer(nn.Module):
         if context.is_prefill and context.cu_seqlens_q is not None:
             # For batched prefill, create positions that restart at 0 for each sequence
             positions = []
+            # example:
+            # seq_len = 3 -> [0, 1, 2]
+            # seq_len = 5 -> [0, 1, 2, 3, 4]
+            # seq_len = 2 -> [0, 1]
+            # positions = [0, 1, 2, 0, 1, 2, 3, 4, 0, 1]
             cu_seqlens = context.cu_seqlens_q.cpu().tolist()
             for i in range(len(cu_seqlens) - 1):
                 seq_len = cu_seqlens[i+1] - cu_seqlens[i]
@@ -226,9 +231,13 @@ class Qwen3DecoderLayer(nn.Module):
             positions = torch.tensor(positions, dtype=torch.long, device=x.device)
         elif context.is_prefill:
             # For single sequence prefill, use sequential positions
+            # 没有累加长度list 说明是单条seq
+            # 直接查看x的第0维 查看长度就行
             positions = torch.arange(x.size(0), device=x.device)
         else:
             # For decode, use context_lens - 1 as positions (current position for each sequence)
+            # decode阶段每次只输入一个token
+            # 所以当前token的位置就是上下文长度减1
             positions = context.context_lens - 1
 
         x = self.self_attn(x, positions=positions)
@@ -241,6 +250,8 @@ class Qwen3DecoderLayer(nn.Module):
 # embedding
 # layers stack
 # final layer norm
+# Qwen3Model        = 只负责把 token 变成 hidden states
+# Qwen3ForCausalLM  = 在 Qwen3Model 外面再包一层，用于语言模型生成
 class Qwen3Model(nn.Module):
     def __init__(
         self,
@@ -295,6 +306,8 @@ class Qwen3Model(nn.Module):
 
 # Qwen3ForCausalLM
 # add lm_head on top of Qwen3Model
+# Qwen3Model        = 只负责把 token 变成 hidden states
+# Qwen3ForCausalLM  = 在 Qwen3Model 外面再包一层，用于语言模型生成
 class Qwen3ForCausalLM(nn.Module):
     packed_module_mapping = {
         "q_proj": ('q_proj', 'q'),
