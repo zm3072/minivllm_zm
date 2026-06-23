@@ -4,6 +4,8 @@ from itertools import count
 from myvllm.sampling_parameters import SamplingParams
 from copy import copy
 
+# seq 是一条生成请求的运行时状态记录：
+# 保存 token 序列、生成进度、KV cache block 映射、调度状态，以及采样相关参数
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -17,6 +19,7 @@ class Sequence:
     def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
         # KV cache 每个block能容纳多少token
         self.block_size = block_size # number of tokens per block
+
         # record sequence id
         self.seq_id = next(Sequence.counter)
         # status
@@ -25,17 +28,21 @@ class Sequence:
         self.token_ids = copy(token_ids)
         # last token
         self.last_token = self.token_ids[-1] if self.token_ids else None
+
         # num_tokens, num_prompt_tokens
         # 初始化时 num_tokens = num_prompt_tokens
         # 后续每生成一个token num_tokens += 1, num_prompt_tokens不变
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(self.token_ids)
+
         # num_cached_tokens = 0
         # 已经放入 KV cache 的 token 数
         self.num_cached_tokens = 0
+
         # block_table
         # 这条序列对应使用过的物理 cache block 编号
         self.block_table = []
+
         # sampling_params' related things
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -107,6 +114,10 @@ class Sequence:
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
             self.block_table,
+            # 区分 prefill 和 decode 阶段
+            # prefill 阶段保存完整的 token_ids 
+            # decode 阶段只保存最后一个 token
+            # 下面__setstate__的 callback
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
 
@@ -118,6 +129,7 @@ class Sequence:
             self.block_table,
             last_token_or_ids
         ) = state
+        
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         # 区分 prefill 和 decode 阶段
         # prefill 阶段保存完整的 token_ids
@@ -126,6 +138,9 @@ class Sequence:
         if num_completion_tokens == 0:
             # Prefill: last_token_or_ids is the full token_ids list
             # last_token_or_ids 是完整的 token_ids 列表
+            # 这里要看__getstate__存进去的是什么
+            # 如果是 prefill 阶段，存进去的是完整的 token_ids 列表
+            # 如果是 decode 阶段，存进去的是最后一个 token
             self.token_ids = last_token_or_ids
         else:
             # Decode: last_token_or_ids is just the last token

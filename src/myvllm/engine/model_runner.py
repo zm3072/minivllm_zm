@@ -12,8 +12,23 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
 
+
+# Sequence:
+#     记录一条请求的 token、block_table、状态
+
+# BlockManager:
+#     给 Sequence 分配物理 KV cache block
+
+# ModelRunner:
+#     根据 Sequence 的 token 和 block_table，真正调用模型 forward
+
 class ModelRunner:
-    def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+    def __init__(
+            self, 
+            config: dict, # 模型和运行配置
+            rank: int,    # 当前进程/ GPU 编号
+            event: Event | list[Event] # 用于多进程通信同步
+        ):
         self.config = config
         self.event = event
 
@@ -22,8 +37,21 @@ class ModelRunner:
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
 
+        
+        # 这部分完全没懂
+
+        # 初始化分布式通信。
+        # nccl 是 GPU 间通信后端。
+        # torch.cuda.set_device(rank) 让当前进程绑定到对应 GPU。
+
+        # 这个通信组建立后，多个进程就可以通过 NCCL 做 GPU 通信
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        dist.init_process_group(
+            'nccl', 
+            "tcp://localhost:12345", 
+            world_size=config['world_size'], 
+            rank=rank
+        )
         torch.cuda.set_device(rank)
 
         # set model
@@ -72,6 +100,8 @@ class ModelRunner:
         self.model = self.model.cuda(rank)
 
         # Load pretrained weights if model_name_or_path is provided
+        # 如果配置里有模型路径
+        # 那就从 checkpoint 加载预训练权重
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
             load_weights_from_checkpoint(self.model, config['model_name_or_path'])
@@ -79,19 +109,33 @@ class ModelRunner:
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
 
+        # 采样层 用 logits 采样下一个 token
+
+        # Sampler层的细节没仔细看 一会补一下
         self.sampler = SamplerLayer()
 
         # Store default dtype before it's needed in allocate_kv_cache
+        # 保存当前默认 dtype
+        # 后面计算 KV cache 大小时需要用到 dtype 的字节数
         self.default_dtype = torch.get_default_dtype()
 
         # Debug flag for first decode step
+        # 调试标志 当前代码里没有实际使用
         self._first_decode = False
 
         # warm up model so that we know peak memory usage
+        # 先跑一次大输入，测出模型峰值显存
         self.warmup_model()
+
         # allocate kv cache
+        # 根据剩余显存分配 KV cache
         self.allocate_kv_cache()
+
+
         # capture cuda graph for decoding
+        # 完全不懂 后续看一下
+        
+        # 如果没有强制 eager 就捕获 decode 阶段的 CUDA graph 加速固定形状 decode。
         if not self.enforce_eager:
             self.capture_cudagraph()
 
@@ -102,9 +146,15 @@ class ModelRunner:
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
             # Synchronize before setting up shared memory
+            # 同步所有 rank
+            # 确保都初始化完模型和 KV cache
             dist.barrier()
             if self.rank == 0:
                 # Try to clean up existing shared memory first
+                # 尝试清理旧共享内存
+                # 啥时候出现的旧共享内存？
+                # SharedMemory用法是什么？
+                # .close()和.unlink()分别是啥？
                 try:
                     old_shm = SharedMemory(name='myvllm')
                     old_shm.close()
@@ -117,63 +167,127 @@ class ModelRunner:
             else:
                 # Wait for rank 0 to create shared memory
                 dist.barrier()
+
+                # 打开 rank0 创建好的共享内存
                 self.shm = SharedMemory(name='myvllm')
                 # Don't call self.loop() here - let the spawning code handle it
                 # Otherwise we'll be stuck in an infinite loop during __init__
 
+
+    # 因为多 GPU 下，每个 GPU 是一个独立进程
+    # rank 0 收到请求后，不能只自己跑模型
+    # 所以需要通过共享内存和事件机制，将任务分发给其他 GPU（worker）进程
     # only use read when rank != 0
     def read_shm(self):
+        # 这个函数只能在多 GPU / 多进程时，并且只能由非 rank 0 的进程调用
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
+        
+        # worker 在这里等待 rank0 发信号
         self.event.wait()
+
+        # share memory layout:
+        # 前 4 字节：后面数据的长度 n
+        # 后 n 字节：pickle 序列化后的真实命令
         n = int.from_bytes(self.shm.buf[:4], 'little') # read length
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+
+        # 这条命令我已经读完了
+        # 下一次还要继续等待 rank 0 重新 event.set()
+        # 如果不 clear()，下一次循环就会直接跳过 wait()，导致重复执行同一条命令
         self.event.clear()
         return method_name, args
 
     # only use write when rank == 0
     def write_shm(self, method_name: str, args: tuple):
+        # 这个函数只能在多 GPU / 多进程时，由 rank 0 调用
         assert self.world_size > 1 and self.rank == 0, "write_shm can only be called when world_size > 1 and rank == 0"
+        
         # encode the length first
         # Flatten: (method_name, args) where args is a tuple -> (method_name, *args)
+
+        # 因为共享内存本身只是一块 bytes 区域，它不知道你写的数据有多长，所以需要手动在前面写长度
+        # method_name = "run" args = (seqs, True)
+        # (method_name, args) -> ("run", (seqs, True))
+        # (method_name, *args) -> ("run", (eqs, True))
+
+        # 下面的整个过程就是写入共享内存
         data = pickle.dumps((method_name, *args))
         n = len(data)
+
+        # share memory layout:
+        # 前 4 字节：后面数据的长度 n
+        # 后 n 字节：pickle 序列化后的真实命令
         self.shm.buf[:4] = n.to_bytes(4, 'little')
         self.shm.buf[4:n+4] = data
+        
+        # 通知每一个 worker
+        # 共享内存里有新命令了，你可以从 wait() 醒来读取了
         for event in self.event:
             event.set()
 
     # close shared memory, destroy process group, delete graphs
+    # 清理资源
     def exit(self):
         if self.world_size > 1:
+            # 关闭当前进程对共享内存的访问句柄
             self.shm.close()
             if self.rank == 0:
+                # 删除系统里的共享内存对象
                 self.shm.unlink()
+
+        # 代码里的逻辑 只要 enforce_eager 为 False
+        # 初始化阶段就会尝试创建 CUDA graph
+        # 所以没有 eager 模式 就直接删掉 CUDA graph 相关的变量
         if not self.enforce_eager:
             del self.graphs
-            del self.graph_vars
-        torch.cuda.synchronize()
-        # Check if process group exists before destroying
+            del self.graph_vars 
+
+        # 清理 Pytorch 分布式通信环境
+        # 确认真的已经初始化过 process group
         if dist.is_initialized():
+            # 真初始化过 再进行销毁
+            # 初始化时 会创建一些底层资源
+            # 如果不用 需要进行销毁
             dist.destroy_process_group()
     
     # wait to read method and args from shared memory
     # execute the method with args
     # write results back to shared memory
+    # 让非 rank 0 的 worker 进程一直待命，等待 rank 0 通过共享内存发命令；
+    # 一旦收到命令，就执行对应方法；
+    # 如果收到 exit，就清理资源并退出循环。
     def loop(self):
         assert self.world_size > 1 and self.rank != 0, "loop can only be called when world_size > 1 and rank != 0"
+        # 不会一直循环下去
+        # 执行完当前的命令后 事件信号会被 clear
+        # 然后 卡在 wait() 里 等待 rank 0 发信号
+        # 等到 rank0 发信号后 通过set() 唤醒 wait()，继续循环
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args) # Unpack args when calling
+            # 遇到 exit 时才退出循环
             if method_name == 'exit':
                 self.exit()
                 break
 
+
     # will be called by both rank == 0 and rank != 0
     # given method name and args from shared memory
     # execute the method and return results
+    # 用统一入口根据字符串方法名调用 ModelRunner 上的实际方法
+    # 如果当前是 rank 0，还会先把这条调用命令广播给 worker
     def call(self, method_name: str, *args: dict):
+
+        # 如果是 rank 0，而且还有 worker
+        # 那 rank 0 在自己执行方法前，要先通知 worker 一起执行
         if self.world_size > 1 and self.rank == 0: # will be called in main engine
+            # rank 0 把这次调用写到共享内存，并通过 event 唤醒 worker
             self.write_shm(method_name, args)
+        
+        # getattr() 是 Python 内置函数，用来根据字符串取对象属性
+        # method_name = "run"
+        # method = getattr(self, "run", None)
+        # method = self.run
         method = getattr(self, method_name, None)
         if method:
             return method(*args)
@@ -183,35 +297,113 @@ class ModelRunner:
     # compute max number of sequence based on max token and max model length
     # run empty sequence to warm up the model
     # clear memory
+
+    # 在正式分配 KV cache 之前
+    # 先用一批假的长序列跑一次模型 prefill
+    # 触发模型执行并测出模型 forward 的峰值显存占用
     def warmup_model(self):
+        
+        # 1. 清理 Pytorch CUDA 缓存池里暂时不用的显存
         torch.cuda.empty_cache()
+
+        # 2. 重置 CUDA 的峰值显存统计
         torch.cuda.reset_peak_memory_stats()
+
+        # 3. 从配置里读取一个 batch 最多允许包含多少 token
         max_tokens = self.config['max_num_batch_tokens']
+        # 3. 读取单条序列的最大长度
         max_model_length = self.config['max_model_length']
+
+        # 4. 估算 warmup 时要构造多少条最大长度序列
+        # 就是为了模拟“单条序列最长”的压力
+        # max_tokens = 8192
+        # max_model_length = 2048
+        # batch_size = 8192 // 2048 = 4
+        # 构造 4 条长度 2048 的序列，总 token 数正好接近最大 batch token 数
         batch_size = max_tokens // max_model_length
+
+        # 5. 构造一批假的 Sequence 每条序列的 token 都是 0
+        # 因为 warmup 的目的不是生成正确结果，而是让模型跑一遍，触发 kernel 和显存分配
+        # 所以用 0 就可以
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        
+        # 6. 调用 run() 执行 prefill forward
+        # 因为 prefill 会处理较长 prompt
+        # 一次性计算大量 token 更容易触发接近真实高负载的显存占用
         self.run(seqs, is_prefill=True)
+
+        # 7. 再次清理 CUDA 缓存
+        # 这一步尽量把不用的显存释放掉
+        # 为后面真正分配 KV cache 做准备
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model
+    # 根据当前 GPU 剩余显存 计算最多能放多少个 KV cache 物理块
+    # 然后一次性分配一个大的 KV cache 池
+    # 并把每一层 Attention 的 k_cache / v_cache 指向这个池
+
+
+    # 3. 算一个 KV cache block 需要多少字节
+    # 4. 算最多能分配多少个 block
+    # 5. 多 GPU 时取所有 rank 中最小的 block 数
+    # 6. 一次性分配大 KV cache tensor
+    # 7. 把每层 Attention 的 k_cache / v_cache 指向对应切片
     def allocate_kv_cache(self):
         # find all available memory
+        # 1. 看 GPU 还有多少显存
+        # free_mem: 当前空闲显存，单位 byte 
+        # total_mem: GPU 总显存，单位 byte
         free_mem, total_mem = torch.cuda.mem_get_info()
+        
+        # 不是把所有空闲显存都拿来用，而是只用其中一部分
+        # 留一点安全余量，避免把 GPU 显存吃满
         total_free_mem = free_mem * self.config['gpu_memory_utilization']
+
+        # 读取之前 warmup 阶段记录到的 峰值显存占用
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
+
+        # 计算当前已经占用的显存
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
         # reserve some room for peak memory usage during model execution
+        
+
+        # 2. 根据 warmup 的峰值显存，预留模型运行时临时显存
+        # peak_mem_usage - current_mem_usage
+        # 模型 forward 运行时，可能额外需要的临时显存
+        
+        # 计算当前可用显存 = 总空闲显存 - (峰值显存占用 - 当前显存占用)
+        # 要减去 这部分 可能需要的临时显存，避免分配 KV cache 后模型 forward 时 OOM
         available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
         
         # find parameters to compute kv cache size
+        # 读取模型层数
         num_layers = self.config['num_layers']
+        
+        # 计算当前 rank 上负责的 KV head 数
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
+        
+        # 计算每个 head 的维度
+        # 如果有就直接读取 否则就计算
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
+
+        # 3. 计算一个 KV cache block 需要多少字节
+            # self.block_size: 每个 block 的 token 数
+            # 2: 因为 KV cache 有 k_cache 和 v_cache
+            # num_layers: 每一层都有 KV cache
+            # num_kv_heads: 当前 rank 上的 KV head 数
+            # head_dim: 每个 head 的维度
+            # self.default_dtype.itemsize: 当前 dtype 的字节数
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        
+        # 4. 计算当前 GPU 上最多能分配多少个 KV cache block
+        # 用可用显存除以单个 block 的大小，得到最多能放多少个 KV cache block
         num_available_kv_blocks = int(available_mem // block_bytes)
+
+        # 5. 检查至少能放 1 个 block
+        # 如果连一个 KV block 都放不下，说明显存不够，直接报错
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
         # Synchronize max_cached_blocks across all ranks.
@@ -221,8 +413,16 @@ class ModelRunner:
         # workers. Without sync, the scheduler (which runs only on rank-0) would use
         # rank-0's local value and could allocate more blocks than some rank can hold,
         # causing an OOM on that rank during KV cache writes.
+
+        # 如果是多 GPU / 多 rank 模式
+        # 需要同步所有 rank 的可用 block 数
+        # 因为不同 rank 的空闲显存可能不一样
+        # 比如 rank 0 可能多了调度器、NCCL buffer、主进程开销，所以它可用显存更少
         if self.world_size > 1:
             print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
+            
+            # 当前 rank 的 block 数变成 CUDA tensor
+            # 因为 dist.all_reduce() 操作的是 tensor 不是普通 Python int
             per_rank_max_blocks_tensor = torch.tensor(
                 num_available_kv_blocks,
                 dtype=torch.long,
@@ -233,24 +433,52 @@ class ModelRunner:
             # This single agreed-upon value is then stored in config so the Scheduler
             # (initialized afterwards on rank-0) never allocates more blocks than any
             # rank can physically hold.
+            
+            # 让所有 rank 交换自己的 num_available_kv_blocks，然后取最小值
             dist.all_reduce(per_rank_max_blocks_tensor, op=dist.ReduceOp.MIN)
             self.config['max_cached_blocks'] = per_rank_max_blocks_tensor.item()
         else:
             # Single GPU: no cross-rank sync needed; use the local value directly.
+            
+            # 单 GPU 就直接本地算出 Block 数
             self.config['max_cached_blocks'] = num_available_kv_blocks
+        
+        # 只让 rank 0 打印最终全局 block 数，避免所有 rank 重复打印
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+
+        # 6. 一次性分配一个大的 KV cache tensor
+        # [2, num_layers, max_cached_blocks, block_size, num_kv_heads, head_dim]
+        allocated_kv_cache = torch.zeros(
+            2, 
+            self.config['num_layers'], 
+            self.config['max_cached_blocks'], 
+            self.block_size, 
+            num_kv_heads, 
+            head_dim, 
+            device=f'cuda:{self.rank}'
+        )
+        
+        # 准备一个层编号
+        # 后面遍历模型模块时 遇到一个 attention 层 就给它分配对应的第 layer_id 层 KV cache
         layer_id = 0
+
+        # 遍历模型里的所有子模块
         for module in self.model.modules():
+            # 判断这个 module 是不是有 k_cache 和 v_cache 属性
+            # 一般 只有 attention 模块才有
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
                 layer_id += 1
+    # 最终效果：
+    # 模型每一层 Attention 都拿到自己的 k_cache/v_cache
+    # 这些 cache 都来自同一个大 tensor allocated_kv_cache 的不同切片
+
 
     # given seqs
     # prepare the data needed for a prefill forward pass
