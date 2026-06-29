@@ -40,8 +40,6 @@ class ModelRunner:
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
 
-        
-        # 这部分完全没懂
 
         # 初始化分布式通信。
         # nccl 是 GPU 间通信后端。

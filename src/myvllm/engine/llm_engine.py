@@ -10,15 +10,22 @@ from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
 
+# 在 worker 进程里初始化一个属于该 rank/GPU 的 ModelRunner
+# 然后进入 loop() 等待 rank 0 发命令
 def worker_process(config, rank, event):
     """Worker process function that initializes ModelRunner and enters loop."""
     # FIRST print before any other code
     import sys
     import os
+    # 多进程里，子进程输出经常会被缓冲
+    # 这几行是为了让 worker 进程里的 print()、报错输出更及时
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
     sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
+    # 创建 worker 自己的 ModelRunner
     model_runner = ModelRunner(config, rank, event)
+
+    # 进入 loop，等待 rank 0 指令
     model_runner.loop()
 
 
